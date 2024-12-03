@@ -5,11 +5,12 @@ use std::cmp::min;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::io::{self, Write};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use mcumgr_smp::{
     application_management::{self, GetImageStateResult, WriteImageChunkResult},
-    os_management::{self, EchoResult},
+    os_management::{self, EchoResult, ResetResult},
     shell_management::{self, ShellResult},
     smp::SmpFrame,
     transport::{
@@ -84,6 +85,8 @@ enum Commands {
 enum OsCmd {
     /// Send an SMP Echo request
     Echo { msg: String },
+    /// Send an SMP Reset request
+    Reset,
 }
 #[derive(Subcommand, Debug)]
 enum ShellCmd {
@@ -96,6 +99,11 @@ enum ShellCmd {
 enum ApplicationCmd {
     /// Request firmware info
     Info,
+    /// Set image state
+    State {
+        #[arg(short, long)]
+        confirm: bool,
+    },
     // /// Erase a partition
     // Erase {
     //     #[arg(short, long)]
@@ -109,6 +117,12 @@ enum ApplicationCmd {
         update_file: PathBuf,
         #[arg(short, long, default_value_t = 512)]
         chunk_size: usize,
+        /// set test mode
+        #[arg(short, long)]
+        test: bool,
+        ///  set os reset
+        #[arg(short, long)]
+        reset: bool,
     },
 }
 
@@ -193,6 +207,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+        Commands::Os(OsCmd::Reset) => {
+            let ret: SmpFrame<ResetResult> = transport
+                .transceive_cbor(os_management::reset(42, true))
+                .await?;
+            match ret.data {
+                ResetResult::Ok {} => {
+                    println!("success");
+                }
+                ResetResult::Err { rc } => {
+                    eprintln!("rc: {}", rc);
+                }
+            }
+        }
         Commands::Shell(ShellCmd::Exec { cmd }) => {
             let ret: SmpFrame<ShellResult> = transport
                 .transceive_cbor(shell_management::shell_command(42, cmd))
@@ -215,6 +242,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             slot,
             update_file,
             chunk_size,
+            test,
+            reset
         }) => {
             let firmware = std::fs::read(&update_file)?;
 
@@ -232,7 +261,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let mut offset = 0;
             while offset < firmware.len() {
-                println!("writing {}/{}", offset, firmware.len());
+                print!("writing {}/{}\r", offset, firmware.len());
+                io::stdout().flush().unwrap();
                 let chunk = &firmware[offset..min(firmware.len(), offset + chunk_size)];
 
                 let resp_frame: SmpFrame<WriteImageChunkResult> = transport
@@ -250,7 +280,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
+            print!("writing {}/{}\n", offset, firmware.len());
             println!("sent all bytes: {}", offset);
+
+            let ret: SmpFrame<GetImageStateResult> = transport
+                .transceive_cbor(application_management::get_state(42))
+                .await?;
+            debug!("{:?}", ret);
+
+            match ret.data {
+                GetImageStateResult::Ok(payload) => {
+                    let ret: SmpFrame<GetImageStateResult> = transport
+                        .transceive_cbor(application_management::set_state(payload.images[1].hash.clone(), !test, 42))
+                    .await?;
+                    debug!("{:?}", ret);
+                }
+                GetImageStateResult::Err(err) => {
+                    eprintln!("rc: {}", err.rc);
+                }
+            }
+            // reset
+            if reset {
+                let _ret: SmpFrame<ResetResult> = transport
+                .transceive_cbor(os_management::reset(42, true))
+                .await?;
+            }
         }
         Commands::App(ApplicationCmd::Info) => {
             let ret: SmpFrame<GetImageStateResult> = transport
@@ -261,6 +315,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match ret.data {
                 GetImageStateResult::Ok(payload) => {
                     println!("{:?}", payload)
+                }
+                GetImageStateResult::Err(err) => {
+                    eprintln!("rc: {}", err.rc);
+                }
+            }
+        }
+        Commands::App(ApplicationCmd::State {confirm}) => {
+            let ret: SmpFrame<GetImageStateResult> = transport
+                .transceive_cbor(application_management::get_state(42))
+                .await?;
+            debug!("{:?}", ret);
+
+            match ret.data {
+                GetImageStateResult::Ok(payload) => {
+                    let ret: SmpFrame<GetImageStateResult> = transport
+                        .transceive_cbor(application_management::set_state(payload.images[1].hash.clone(), confirm, 42))
+                    .await?;
+                    debug!("{:?}", ret);
                 }
                 GetImageStateResult::Err(err) => {
                     eprintln!("rc: {}", err.rc);
